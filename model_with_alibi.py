@@ -12,12 +12,12 @@ class ALiBiPositionalEncoding(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         # Use standard ALiBi slope formula: 2^(-8i/n) for head i
-        slopes = torch.tensor([2**(-8 * (i + 1) / num_heads) for i in range(num_heads)])
+        slopes = torch.tensor([2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)])
         self.register_buffer('slopes', slopes)
-    
+
     def forward(self, attn_scores, h, w):
         """
-        Apply ALiBi bias to attention scores
+        Apply ALiBi bias to attention scores.
         Args:
             attn_scores: attention scores [B, num_heads, H*W, H*W]
             h: height of feature map
@@ -25,24 +25,27 @@ class ALiBiPositionalEncoding(nn.Module):
         """
         device = attn_scores.device
         B, num_heads, seq_len, _ = attn_scores.shape
-        
-        # Create relative position indices for height and width
-        pos_h = torch.arange(h, device=device)
-        pos_w = torch.arange(w, device=device)
-        rel_pos_h = pos_h[:, None] - pos_h[None, :]  # [h, h]
-        rel_pos_w = pos_w[:, None] - pos_w[None, :]  # [w, w]
-        
-        # Combine into 2D relative positions
-        rel_pos_h = rel_pos_h.unsqueeze(-1).expand(-1, -1, w).reshape(h * w, h * w)  # [H*W, H*W]
-        rel_pos_w = rel_pos_w.unsqueeze(0).expand(h, -1, -1).reshape(h * w, h * w)    # [H*W, H*W]
-        
-        # Compute biases (negative slopes * distance)
-        bias = -self.slopes.view(1, num_heads, 1, 1) * (
-            rel_pos_h.abs().unsqueeze(0).unsqueeze(0) +  # [1, 1, H*W, H*W]
-            rel_pos_w.abs().unsqueeze(0).unsqueeze(0)
-        )
-        
+
+        # Create 2D grid of coordinates
+        y_coords = torch.arange(h, device=device)
+        x_coords = torch.arange(w, device=device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')  # shape [h, w]
+
+        # Flatten to 1D for H*W positions
+        y_flat = y_grid.reshape(-1)  # [H*W]
+        x_flat = x_grid.reshape(-1)  # [H*W]
+
+        # Compute pairwise absolute distances (Manhattan)
+        dy = (y_flat[:, None] - y_flat[None, :]).abs()  # [H*W, H*W]
+        dx = (x_flat[:, None] - x_flat[None, :]).abs()  # [H*W, H*W]
+        dist = dy + dx  # Manhattan distance [H*W, H*W]
+
+        # Expand slopes to apply one per head
+        # Resulting bias shape: [1, num_heads, H*W, H*W]
+        bias = -self.slopes.view(1, num_heads, 1, 1) * dist.unsqueeze(0).unsqueeze(0)
+
         return attn_scores + bias
+
 
 class MultiHeadSelfAttention(nn.Module):
     """Multi-head self-attention with ALiBi positional encoding"""
