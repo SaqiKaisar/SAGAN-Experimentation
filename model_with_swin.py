@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
+import timm
+from timm.layers import PatchEmbed
 
 def _get_num_heads(dim: int, base: int = 32) -> int:
 	"""Heuristic to choose number of heads proportional to channel dim."""
@@ -287,154 +289,175 @@ class ResidualBlock1(nn.Module):
         return s_c + y
     
 class Generator(nn.Module):
-    """Generator network."""
-    def __init__(self, conv_dim=64, c_dim=5, repeat_num=6,device = 'cuda:6',num_memory = 4):
+    """Generator with SwinV2-Tiny encoder and symmetric Swin-based decoder (with skip connections)."""
+    def __init__(self, conv_dim=64, c_dim=0, repeat_num=6, device='cuda:0', num_memory=0):
         super(Generator, self).__init__()
-        self.num_memory = num_memory
 
-        # Input projection (replace initial conv with per-pixel linear)
-        self.layer1 = PerPixelLinear(1+c_dim, conv_dim, act=True)
-
-        # Down-sampling layers.
-        curr_dim = conv_dim
-        # Encoder stage 1: Swin + patch merge (replaces strided conv)
-        self.swin_e1 = SwinStage(dim=curr_dim, depth=2, input_resolution=None, window_size=8)
-        self.enc_merge1 = PatchMerging2d(curr_dim)
-        curr_dim = curr_dim * 2
-        self.p_bn1 = self.position_bn(curr_dim=curr_dim,num_memory=self.num_memory)
-
-
-        # Encoder stage 2: Swin + patch merge
-        self.swin_e2 = SwinStage(dim=curr_dim, depth=2, input_resolution=None, window_size=4)
-        self.enc_merge2 = PatchMerging2d(curr_dim)
-        curr_dim = curr_dim * 2
-        self.p_bn2 = self.position_bn(curr_dim=curr_dim,num_memory=self.num_memory)
-
-        # Encoder stage 3: Swin + patch merge
-        self.swin_e3 = SwinStage(dim=curr_dim, depth=2, input_resolution=None, window_size=4)
-        self.enc_merge3 = PatchMerging2d(curr_dim)
-        curr_dim = curr_dim * 2
-        
-        # Bottleneck layers.
-
-        # Bottleneck: condition projection + Swin only
-        self.cond_proj = PositionProjector(curr_dim + int(np.log2(num_memory)+1), curr_dim)
-        self.swin_bn = SwinStage(dim=curr_dim, depth=repeat_num, input_resolution=None, window_size=4)
-
-
-        # Up-sampling layers.
-        self.gate1 = AttentionGate(F_g=curr_dim,F_l=curr_dim,n_coefficients=curr_dim//2)
-        self.dec_fuse1 = PerPixelLinear(2*curr_dim, curr_dim, act=True)
-        self.swin_d1 = SwinStage(dim=curr_dim, depth=2, input_resolution=None, window_size=4)
-        self.dec_up1 = PatchExpand2d(curr_dim)
-        curr_dim = curr_dim // 2
-        self.up_conv1 = nn.Sequential(
-            PatchExpand2d(curr_dim),
-            PatchExpand2d(max(1, curr_dim//2))
+        # Encoder: timm SwinV2-Tiny, use features_only to get multi-scale skips.
+        # Use single-channel inputs directly.
+        self.encoder = timm.create_model(
+            'swinv2_tiny_window8_256',
+            features_only=True,
+            out_indices=(0, 1, 2, 3),
+            in_chans=1,
+            pretrained=False
         )
+        enc_channels = self.encoder.feature_info.channels()
+        self.enc_channels = enc_channels
+        # relax strict input-size checks & keep a reference to patch_embed
+        self.patch_embed = None
+        self.basic_layers = []
+        for m in self.encoder.modules():
+            if isinstance(m, PatchEmbed):
+                m.strict_img_size = False
+                self.patch_embed = m
+            # collect Swin BasicLayers by duck-typing
+            if hasattr(m, 'input_resolution') and hasattr(m, 'window_size') and hasattr(m, 'blocks'):
+                self.basic_layers.append(m)
 
+        # Bottleneck (keep identity to avoid mismatch with variable feature layouts)
+        self.bottleneck = nn.Identity()
 
-        self.gate2 = AttentionGate(F_g=curr_dim,F_l=curr_dim,n_coefficients=curr_dim//2)
-        self.dec_fuse2 = PerPixelLinear(2*curr_dim, curr_dim, act=True)
-        self.swin_d2 = SwinStage(dim=curr_dim, depth=2, input_resolution=None, window_size=4)
-        self.dec_up2 = PatchExpand2d(curr_dim)
-        curr_dim = curr_dim // 2
+        # Decoder stages (mirror encoder with PatchExpand2d + Swin + AttentionGate + fusion)
+        # Stage 3: f4 -> f3 scale
+        self.dec_up3 = PatchExpand2d(enc_channels[-1])
+        dec3_c = max(1, enc_channels[-1] // 2)
+        self.gate3 = AttentionGate(F_g=dec3_c, F_l=enc_channels[-2], n_coefficients=max(8, enc_channels[-2] // 2))
+        self.dec_fuse3 = PerPixelLinear(dec3_c + enc_channels[-2], enc_channels[-2], act=True)
+        self.swin_d3 = SwinStage(dim=enc_channels[-2], depth=2, input_resolution=None, window_size=4)
 
-        self.up_conv2 = nn.Sequential(
-            PatchExpand2d(curr_dim)
-        )
+        # Stage 2: f3 -> f2 scale
+        self.dec_up2 = PatchExpand2d(enc_channels[-2])
+        dec2_c = max(1, enc_channels[-2] // 2)
+        self.gate2 = AttentionGate(F_g=dec2_c, F_l=enc_channels[-3], n_coefficients=max(8, enc_channels[-3] // 2))
+        self.dec_fuse2 = PerPixelLinear(dec2_c + enc_channels[-3], enc_channels[-3], act=True)
+        self.swin_d2 = SwinStage(dim=enc_channels[-3], depth=2, input_resolution=None, window_size=4)
 
-        self.gate3= AttentionGate(F_g=curr_dim,F_l=curr_dim,n_coefficients=curr_dim//2)
-        self.dec_fuse3 = PerPixelLinear(2*curr_dim, curr_dim, act=True)
-        self.swin_d3 = SwinStage(dim=curr_dim, depth=2, input_resolution=None, window_size=4)
-        self.dec_up3 = PatchExpand2d(curr_dim)
-        curr_dim = curr_dim // 2
-        self.bn3 = PerPixelLinear(3*curr_dim, curr_dim, act=True)
+        # Stage 1: f2 -> f1 scale
+        self.dec_up1 = PatchExpand2d(enc_channels[-3])
+        dec1_c = max(1, enc_channels[-3] // 2)
+        self.gate1 = AttentionGate(F_g=dec1_c, F_l=enc_channels[-4], n_coefficients=max(8, enc_channels[-4] // 2))
+        self.dec_fuse1 = PerPixelLinear(dec1_c + enc_channels[-4], enc_channels[-4], act=True)
+        self.swin_d1 = SwinStage(dim=enc_channels[-4], depth=2, input_resolution=None, window_size=4)
+
+        # Final upsampling to match original resolution (compensate timm patch embed stride=4)
+        self.final_up1 = PatchExpand2d(enc_channels[-4])
+        self.final_up2 = PatchExpand2d(max(1, enc_channels[-4] // 2))
 
         # Final projection to 1 channel
-        self.final_proj = PerPixelLinear(curr_dim, 1, act=False)
-        self.binary_encoding = binarize(torch.arange(0,self.num_memory,dtype=torch.int), int(np.log2(num_memory)+1))
+        self.final_proj = PerPixelLinear(max(1, enc_channels[-4] // 4), 1, act=False)
 
-    def forward(self, x,bs=1):
-        y = self.layer1(x)
+    def forward(self, x, bs=1):
+        # x is windowed input: (bs * num_windows, C, w, w). Reassemble to full images for timm.
+        B_in, C_in, wH, wW = x.shape
+        assert C_in == 1, "Generator expects single-channel inputs."
+        num_windows = max(1, B_in // max(1, bs))
+        grid_dim = int(np.sqrt(num_windows))
+        assert grid_dim * grid_dim == num_windows, "Window count must be a perfect square."
 
-        y1 = self.swin_e1(y)
-        y1 = self.enc_merge1(y1)
-        _,C,W,H = y1.shape
-        y1 = y1.view(bs,self.num_memory,C,W,H)
-        y1 = self.add_condition(y1,bs,num_windows=self.num_memory)
-        y1 = y1.view(bs * self.num_memory,-1,W,H)
-        y1 = self.p_bn1(y1)
-        sc = []
-        sc.append(y1)
+        # windows -> full images
+        x_full = window_reverse(x.permute(0, 2, 3, 1).contiguous(), wH, wH * grid_dim, wW * grid_dim).permute(0, 3, 1, 2).contiguous()
 
-        y2 = self.swin_e2(y1)
-        y2 = self.enc_merge2(y2)
-        _,C,W,H = y2.shape
-        y2 = y2.view(bs,self.num_memory,C,W,H)
-        y2 = self.add_condition(y2,bs,num_windows=self.num_memory)
-        y2 = y2.view(bs * self.num_memory,-1,W,H)
-        y2 = self.p_bn2(y2)
-        sc.append(y2)
+        # ensure timm patch_embed matches current full input size
+        if self.patch_embed is not None:
+            H, W = x_full.shape[-2], x_full.shape[-1]
+            self.patch_embed.img_size = (H, W)
+            ps = self.patch_embed.patch_size
+            if isinstance(ps, int):
+                ps = (ps, ps)
+            self.patch_embed.grid_size = (H // ps[0], W // ps[1])
+            self.patch_embed.num_patches = self.patch_embed.grid_size[0] * self.patch_embed.grid_size[1]
+            # update Swin stage input resolutions dynamically (per stage)
+            tH, tW = self.patch_embed.grid_size
+            for i, layer in enumerate(self.basic_layers):
+                in_res = (max(1, tH // (2 ** i)), max(1, tW // (2 ** i)))
+                layer.input_resolution = in_res
+                if hasattr(layer, 'shift_size'):
+                    layer.shift_size = 0
+                if hasattr(layer, 'attn_mask'):
+                    layer.attn_mask = None
+                if hasattr(layer, 'blocks'):
+                    for blk in layer.blocks:
+                        if hasattr(blk, 'shift_size'):
+                            blk.shift_size = 0
 
-        y3 = self.swin_e3(y2)
-        y3 = self.enc_merge3(y3)
-        sc.append(y3)
+        # Optionally upsample to encoder's native size for stable window/mask shapes
+        H0, W0 = x_full.shape[-2], x_full.shape[-1]
+        x_enc_in = F.interpolate(x_full, size=(256, 256), mode='bilinear', align_corners=False)
 
-        y = y3
-        B,C,W,H = y.shape
-        y = y.view(bs,self.num_memory,C,W,H)
-        y_p = self.add_condition(y,bs,num_windows=self.num_memory)
-        y_p = y_p.view(bs * self.num_memory,-1,W,H)
-        embedding = self.cond_proj(y_p)
-        embedding = self.swin_bn(embedding)
+        # Encoder forward on full (resized) images
+        if self.patch_embed is not None:
+            self.patch_embed.img_size = (256, 256)
+            ps = self.patch_embed.patch_size
+            if isinstance(ps, int):
+                ps = (ps, ps)
+            self.patch_embed.grid_size = (256 // ps[0], 256 // ps[1])
+            self.patch_embed.num_patches = self.patch_embed.grid_size[0] * self.patch_embed.grid_size[1]
+            tH, tW = self.patch_embed.grid_size
+            for i, layer in enumerate(self.basic_layers):
+                in_res = (max(1, tH // (2 ** i)), max(1, tW // (2 ** i)))
+                layer.input_resolution = in_res
+                if hasattr(layer, 'shift_size'):
+                    layer.shift_size = 0
+                if hasattr(layer, 'attn_mask'):
+                    layer.attn_mask = None
+                if hasattr(layer, 'blocks'):
+                    for blk in layer.blocks:
+                        if hasattr(blk, 'shift_size'):
+                            blk.shift_size = 0
 
-        i = 0
-        sc1 = self.gate1(gate=embedding,skip_connection=embedding)
-        out1 = torch.concat([embedding,sc1],dim=1)
-        out1 = self.dec_fuse1(out1)
-        out1 = self.swin_d1(out1)
-        out1 = self.dec_up1(out1)
+        f1, f2, f3, f4 = self.encoder(x_enc_in)
+        # Ensure NCHW ordering for all features
+        def _ensure_nchw(t, exp_c):
+            if t.dim() == 4 and t.shape[-1] == exp_c and t.shape[1] != exp_c:
+                return t.permute(0, 3, 1, 2).contiguous()
+            return t
+        f1 = _ensure_nchw(f1, self.enc_channels[0])
+        f2 = _ensure_nchw(f2, self.enc_channels[1])
+        f3 = _ensure_nchw(f3, self.enc_channels[2])
+        f4 = _ensure_nchw(f4, self.enc_channels[3])
 
-        i += 1
-        sc2 = self.gate2(gate=out1,skip_connection=sc[-1-i])
-        out2 = torch.concat([out1,sc2],dim=1)
-        out2 = self.dec_fuse2(out2)
-        out2 = self.swin_d2(out2)
-        out2 = self.dec_up2(out2)
+        # Bottleneck
+        y = self.bottleneck(f4)
 
-        i += 1
-        sc3 = self.gate3(gate=out2,skip_connection=sc[-1-i])
-        out3 = torch.concat([out2,sc3],dim=1)
-        out3 = self.dec_fuse3(out3)
-        out3 = self.swin_d3(out3)
-        out3 = self.dec_up3(out3)
+        # Decoder stage 3 (deepest skip)
+        y = self.dec_up3(y)
+        sc3 = self.gate3(gate=y, skip_connection=f3)
+        y = torch.cat([y, sc3], dim=1)
+        y = self.dec_fuse3(y)
+        y = self.swin_d3(y)
 
-        out1 = self.up_conv1(out1)
-        out2 = self.up_conv2(out2)
-        out = torch.concat([out1,out2,out3],dim=1)
-        out = self.bn3(out)
+        # Decoder stage 2
+        y = self.dec_up2(y)
+        sc2 = self.gate2(gate=y, skip_connection=f2)
+        y = torch.cat([y, sc2], dim=1)
+        y = self.dec_fuse2(y)
+        y = self.swin_d2(y)
 
-        output = self.final_proj(out)
+        # Decoder stage 1
+        y = self.dec_up1(y)
+        sc1 = self.gate1(gate=y, skip_connection=f1)
+        y = torch.cat([y, sc1], dim=1)
+        y = self.dec_fuse1(y)
+        y = self.swin_d1(y)
+
+        # Final upsampling to original patch resolution
+        y = self.final_up1(y)
+        y = self.final_up2(y)
+        output = self.final_proj(y)
+        # Downsample back to original full-image size
+        output = F.interpolate(output, size=(H0, W0), mode='bilinear', align_corners=False)
 
         if self.training:
-            # spatial binary mask
-            mask = torch.ones(output.size(0), 1, output.size(-2), output.size(-1)).to(output.device) * 0.95
+            mask = torch.ones(output.size(0), 1, output.size(-2), output.size(-1), device=output.device) * 0.95
             mask = torch.bernoulli(mask).float()
-            output = mask * output + (1. - mask) * x
-        fake1 = torch.tanh(output+x)
-    
-        return fake1
-    
-    def add_condition(self, x, bs, num_windows):
-        condition = self.binary_encoding.to(x.device).view(1, self.binary_encoding.shape[0], self.binary_encoding.shape[1], 1, 1)
-        condition = condition.expand(bs, -1, -1, x.size(-2), x.size(-1)).contiguous().float()
-        x = torch.cat((x, condition), dim=2)
-        return x
-    
-    def position_bn(self,curr_dim,num_memory = 4):
-        # Replace 1x1 conv with per-pixel linear projection
-        return PositionProjector(curr_dim + int(np.log2(num_memory)+1), curr_dim)
+            output = mask * output + (1. - mask) * x_full
+        fake_full = torch.tanh(output + x_full)
+
+        # full images -> windows, to match solver expectations
+        win = window_partition(fake_full.permute(0, 2, 3, 1).contiguous(), wH)
+        win = win.permute(0, 3, 1, 2).contiguous()
+        return win
 
 class Discriminator(nn.Module):
     """Discriminator network with PatchGAN."""
